@@ -17,6 +17,11 @@ pub struct Renderer {
     needs_newline_before_tool: bool,
     tool_slots: Vec<ToolSlot>,
     is_tty: bool,
+    /// True when the cursor is on the last spinner line (no trailing \n).
+    spinner_line_active: bool,
+    /// Extra lines inserted (e.g. warnings) while tool_slots are active,
+    /// which offset the cursor from the expected position.
+    extra_lines: usize,
 }
 
 impl Renderer {
@@ -28,6 +33,8 @@ impl Renderer {
             needs_newline_before_tool: false,
             tool_slots: Vec::new(),
             is_tty,
+            spinner_line_active: false,
+            extra_lines: 0,
         }
     }
 
@@ -50,14 +57,25 @@ impl Renderer {
                 continue;
             }
             let elapsed = slot.start_time.elapsed().as_secs_f64();
-            let offset = (n - i) * 2 - 1;
-            // Move up to status line, clear it, write spinner, move back
-            write!(w, "\x1b[{}A\x1b[2K\r", offset)?;
             let frame = self.style.spinner_frame(slot.spinner_frame);
             slot.spinner_frame += 1;
             let line = format!("  {} running... ({:.1}s)", frame, elapsed);
-            self.style.write_dim(&mut w, &line)?;
-            write!(w, "\x1b[{}B\r", offset)?;
+
+            if self.spinner_line_active && i == n - 1 {
+                // Last spinner is on cursor line (no \n) — use \r to overwrite
+                write!(w, "\r\x1b[K")?;
+                self.style.write_dim(&mut w, &line)?;
+            } else {
+                // Earlier spinner — use cursor-up
+                let offset = if self.spinner_line_active {
+                    (n - 1 - i) * 2 + self.extra_lines
+                } else {
+                    (n - i) * 2 - 1 + self.extra_lines
+                };
+                write!(w, "\x1b[{}A\x1b[2K\r", offset)?;
+                self.style.write_dim(&mut w, &line)?;
+                write!(w, "\x1b[{}B\r", offset)?;
+            }
         }
         w.flush()?;
         Ok(())
@@ -66,6 +84,12 @@ impl Renderer {
     pub fn render(&mut self, event: AgentEvent) -> io::Result<()> {
         let stdout = io::stdout();
         let mut w = stdout.lock();
+
+        // Finalize active spinner line (add \n) before any non-result output
+        if self.spinner_line_active && !matches!(event, AgentEvent::ToolResult { .. }) {
+            write!(w, "\n")?;
+            self.spinner_line_active = false;
+        }
 
         // Defensive: unexpected events while tools are active → clear tool state
         // Allow tool events and lightweight status events through
@@ -80,6 +104,7 @@ impl Renderer {
             )
         {
             self.tool_slots.clear();
+            self.extra_lines = 0;
         }
 
         match event {
@@ -171,10 +196,11 @@ impl Renderer {
                 self.style.write_cyan(&mut w, &line)?;
 
                 if self.is_tty {
-                    // Write initial spinner line
+                    // Write initial spinner (no \n — will be overwritten by result via \r)
                     let frame = self.style.spinner_frame(0);
-                    let spinner_line = format!("  {} running... (0.0s)\n", frame);
+                    let spinner_line = format!("  {} running... (0.0s)", frame);
                     self.style.write_dim(&mut w, &spinner_line)?;
+                    self.spinner_line_active = true;
                 }
 
                 self.tool_slots.push(ToolSlot {
@@ -222,15 +248,31 @@ impl Renderer {
                 if self.is_tty {
                     if let Some(i) = slot_idx {
                         let n = self.tool_slots.len();
-                        let offset = (n - i) * 2 - 1;
-                        // Move up to status line, clear, write result, move back
-                        write!(w, "\x1b[{}A\x1b[2K\r", offset)?;
-                        if is_error {
-                            self.style.write_red(&mut w, &result_line)?;
+                        if self.spinner_line_active && i == n - 1 {
+                            // Last spinner is on cursor line — overwrite with \r
+                            write!(w, "\r\x1b[K")?;
+                            if is_error {
+                                self.style.write_red(&mut w, &result_line)?;
+                            } else {
+                                self.style.write_green(&mut w, &result_line)?;
+                            }
+                            write!(w, "\n")?;
+                            self.spinner_line_active = false;
                         } else {
-                            self.style.write_green(&mut w, &result_line)?;
+                            // Earlier spinner — use cursor-up
+                            let offset = if self.spinner_line_active {
+                                (n - 1 - i) * 2 + self.extra_lines
+                            } else {
+                                (n - i) * 2 - 1 + self.extra_lines
+                            };
+                            write!(w, "\x1b[{}A\x1b[2K\r", offset)?;
+                            if is_error {
+                                self.style.write_red(&mut w, &result_line)?;
+                            } else {
+                                self.style.write_green(&mut w, &result_line)?;
+                            }
+                            write!(w, "\x1b[{}B\r", offset)?;
                         }
-                        write!(w, "\x1b[{}B\r", offset)?;
                         self.tool_slots[i].completed = true;
                     }
                 } else {
@@ -248,12 +290,17 @@ impl Renderer {
                 // If all completed, clear slots
                 if self.tool_slots.iter().all(|s| s.completed) {
                     self.tool_slots.clear();
+                    self.spinner_line_active = false;
+                    self.extra_lines = 0;
                 }
             }
             AgentEvent::Compaction => {
                 self.ensure_newline(&mut w)?;
                 let msg = format!("{} Context compacted\n", self.style.icon_compact());
                 self.style.write_dim(&mut w, &msg)?;
+                if !self.tool_slots.is_empty() {
+                    self.extra_lines += 1;
+                }
             }
             AgentEvent::UserMessage(message) => {
                 self.ensure_newline(&mut w)?;
@@ -269,6 +316,9 @@ impl Renderer {
                 self.ensure_newline(&mut w)?;
                 let msg = format!("{} {}\n", self.style.icon_warn(), message);
                 self.style.write_yellow(&mut w, &msg)?;
+                if !self.tool_slots.is_empty() {
+                    self.extra_lines += 1;
+                }
             }
             AgentEvent::SessionEnd {
                 success,
