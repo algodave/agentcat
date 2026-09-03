@@ -35,6 +35,41 @@ struct Cli {
     debug: bool,
 }
 
+/// How far into the stream we keep looking for the line that identifies the
+/// format. Real headers arrive within the first few lines; these caps bound
+/// the buffer so a stream that never identifies itself can't grow unbounded.
+const DETECT_MAX_LINES: usize = 32;
+const DETECT_MAX_BYTES: usize = 1 << 20; // 1 MiB
+
+/// Parse one line and render whatever events it yields. A line that fails to
+/// parse is skipped (reported only with --debug) rather than killing the stream.
+fn handle_line(
+    parser: &mut Box<dyn parse::EventParser>,
+    renderer: &mut Renderer,
+    line: &str,
+    debug: bool,
+    last_success: &mut bool,
+) {
+    match parser.parse(line) {
+        Ok(events) => {
+            for event in events {
+                if let event::AgentEvent::SessionEnd { success, .. } = &event {
+                    *last_success = *success;
+                }
+                if let Err(e) = renderer.render(event) {
+                    eprintln!("Render error: {}", e);
+                    process::exit(2);
+                }
+            }
+        }
+        Err(e) => {
+            if debug {
+                eprintln!("Parse error: {}", e);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -61,52 +96,60 @@ async fn main() {
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
 
-    // Read first line
-    let first_line = match lines.next_line().await {
-        Ok(Some(line)) => line,
-        Ok(None) => {
-            eprintln!("Error: empty stdin");
-            process::exit(2);
-        }
-        Err(e) => {
-            eprintln!("Error reading stdin: {}", e);
-            process::exit(2);
-        }
-    };
+    // Buffer the leading lines until one of them identifies the format. Agents
+    // emit out-of-band events before the session header (claude, for instance,
+    // can lead with rate_limit_event), so the first line alone isn't reliable.
+    // The buffer is capped both ways so an unrecognized stream fails fast
+    // instead of being held in memory until EOF.
+    let mut leading: Vec<String> = Vec::new();
+    let mut leading_bytes = 0usize;
+    let mut detected: Option<Format> = None;
 
-    // Detect or use forced format
-    let format = match forced_format {
-        Some(f) => f,
-        None => match detect_format(&first_line) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("{}", e);
-                process::exit(2);
+    if forced_format.is_none() {
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    detected = detect_format(&line).ok();
+                    leading_bytes += line.len();
+                    leading.push(line);
+                    if detected.is_some() {
+                        break;
+                    }
+                    if leading.len() >= DETECT_MAX_LINES || leading_bytes >= DETECT_MAX_BYTES {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("Error reading stdin: {}", e);
+                    process::exit(2);
+                }
             }
-        },
+        }
+    }
+
+    let format = match forced_format.or(detected) {
+        Some(f) => f,
+        None => {
+            if leading.is_empty() {
+                eprintln!("Error: empty stdin");
+            } else {
+                eprintln!("Error: unrecognized stream format");
+            }
+            process::exit(2);
+        }
     };
 
     let mut parser = create_parser(format, cli.debug);
     let mut renderer = Renderer::new(cli.show_thinking, use_emoji, use_color, is_tty);
     let mut last_success = true;
 
-    // Process first line
-    match parser.parse(&first_line) {
-        Ok(events) => {
-            for event in events {
-                if let event::AgentEvent::SessionEnd { success, .. } = &event {
-                    last_success = *success;
-                }
-                if let Err(e) = renderer.render(event) {
-                    eprintln!("Render error: {}", e);
-                    process::exit(2);
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("Parse error: {}", e);
-            process::exit(2);
-        }
+    // Replay the buffered lines now that we know how to read them
+    for line in &leading {
+        handle_line(&mut parser, &mut renderer, line, cli.debug, &mut last_success);
     }
 
     // Process remaining lines with spinner support
@@ -123,25 +166,7 @@ async fn main() {
                         if line.trim().is_empty() {
                             continue;
                         }
-                        match parser.parse(&line) {
-                            Ok(events) => {
-                                for event in events {
-                                    if let event::AgentEvent::SessionEnd { success, .. } = &event {
-                                        last_success = *success;
-                                    }
-                                    if let Err(e) = renderer.render(event) {
-                                        eprintln!("Render error: {}", e);
-                                        process::exit(2);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                if cli.debug {
-                                    eprintln!("Parse error: {}", e);
-                                }
-                                // Don't exit on single parse errors, continue
-                            }
-                        }
+                        handle_line(&mut parser, &mut renderer, &line, cli.debug, &mut last_success);
                     }
                     Ok(None) => break,
                     Err(e) => {
