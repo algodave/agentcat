@@ -49,6 +49,27 @@ agentcat [OPTIONS]
 
 The `NO_COLOR` environment variable is also respected.
 
+### OpenCode compatibility
+
+OpenCode V2 CLI JSON tool records are supported, with synthetic regression tests
+pinned to v2.2.6. The existing string-state tool format remains supported.
+To include reasoning, OpenCode must emit it; agentcat only controls its display:
+
+```bash
+opencode run --format json --thinking "prompt" | agentcat --show-thinking
+```
+
+Completed tool records are adapted to the existing renderer, so a TTY may briefly
+show a synthetic spinner; tool/reasoning timings can reflect local rendering,
+not upstream execution. Tool errors are recoverable; session errors fail at EOF.
+Shell exit/signal/timeout/status metadata is not interpreted: completed tools can
+show a success marker despite command failure or still-running background work
+(including subagents). Error-only streams without `step_start` require
+`--format opencode`. Informational `retry` and `background_wait` records are
+ignored. The footer retains existing token mappings, not complete
+reasoning-token/cache-write accounting. See [SPEC.md](SPEC.md#input-format-opencode)
+for the field contract and limitations.
+
 ## What it shows
 
 - Session info (agent type, model, session ID)

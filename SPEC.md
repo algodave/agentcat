@@ -836,23 +836,85 @@ turn.completed (with usage)
 
 **Command:** `opencode run --format json "prompt" | agentcat`
 
+**Reasoning:** `opencode run --format json --thinking "prompt" | agentcat --show-thinking`.
+OpenCode must emit reasoning (normally with `--thinking`); `--show-thinking` only
+controls display of supplied content.
+
+The V2 CLI field contract below covers **v2.2.6**.
+
 All events have the structure: `{"type":"<type>","timestamp":<ms>,"sessionID":"ses_xxx",...}`
 
 ### Event Types
 
 | Event type | Key fields | Description |
 |---|---|---|
-| `step_start` | `part.sessionID` | Start of a new step; first occurrence triggers session start |
-| `text` | `part.text` | Complete text output from the model |
-| `reasoning` | `part.text` | Model reasoning/thinking block |
-| `tool_use` (state=`"running"`) | `part.name`, `part.input` | Tool invocation started |
-| `tool_use` (state=`"completed"`) | `part.output` | Tool completed successfully |
-| `tool_use` (state=`"error"`) | `part.output` | Tool completed with error |
+| `step_start` | `part.sessionID`, falling back to envelope `sessionID` | Start of a new step; first occurrence triggers session start |
+| `text` | `part.text` | Full supplied text block or reconciliation suffix |
+| `reasoning` | `part.text` | Full supplied reasoning block or reconciliation suffix |
+| `tool_use` (`part.state.status="completed"`) | `part.tool`, `part.id`, `part.state.input`, `part.state.output` | Finished tool call |
+| `tool_use` (`part.state.status="error"`) | `part.tool`, `part.id`, `part.state.input`, `part.state.error` | Recoverable tool failure |
 | `step_finish` | `part.tokens`, `part.cost` | Step completed with usage stats |
-| `error` | `error.data.message` | Error occurred |
+| `error` | `error.message` (also accepts `error.data.message`, preferred if both exist) | Session failure reported at EOF |
+| `retry` | `messageID`, `attempt`, `nextRetryAt`, `error` | Informational; ignored, not a session failure |
+| `background_wait` | `jobs[]` (`id`, `kind`, `title`) | Informational; ignored while later records continue normally |
 | `message.part.updated` | — | Ignored |
 | `session.status` | — | Ignored |
 | `session.error` | — | Ignored |
+
+### Nested Tool Records
+
+Synthetic completed-record example:
+
+```json
+{
+  "type": "tool_use",
+  "timestamp": 1700000000100,
+  "sessionID": "ses_synthetic",
+  "part": {
+    "partID": "prt_cli_part",
+    "sessionID": "ses_synthetic",
+    "messageID": "msg_assistant",
+    "type": "tool",
+    "id": "call_read",
+    "tool": "read",
+    "state": {
+      "status": "completed",
+      "input": { "path": "src/main.rs" },
+      "output": "first line\nsecond line",
+      "title": "read",
+      "metadata": { "metadata": { "truncated": false } },
+      "time": { "start": 1700000000000, "end": 1700000000100 }
+    }
+  }
+}
+```
+
+Each completed/error record emits `ToolStart`, `ToolReady`, then `ToolResult`.
+All three use **`part.id`**, the call ID, not the distinct CLI `part.partID`.
+Absent call IDs remain `None`; absent tool names display as `unknown`.
+Completed content comes from string `state.output`; error content comes from
+string `state.error`, never `state.output`. Missing/non-string content is empty.
+Unknown object-state statuses are ignored (with diagnostics under `--debug`);
+no nested running/progress lifecycle is synthesized.
+
+OpenCode-local summary rules, without changing the displayed tool name:
+
+| Tool | Summary from `state.input` |
+|---|---|
+| `skill` | String `id`, otherwise generic JSON fallback |
+| `read` | String `path` (including `skill://…` URIs), otherwise generic JSON fallback |
+| `shell` | Existing Bash `command` summary (80-character truncation/fallback) |
+| `subagent` | Existing Agent `description` summary (60-character truncation) and optional `model` |
+| `glob`, `grep`, others | Existing shared `tool_summary` rules |
+
+Successful output is retained for line counts but not printed, including loaded
+skill bodies. A failed tool shows only the first error line and does not mark the
+session failed.
+
+The existing string-state format remains supported independently: `part.state`
+is `"running"`, `"completed"`, or `"error"`; running records use `part.name` and
+`part.input`, while completed/error records use `part.output`. These records
+retain their existing events and absent call IDs.
 
 ### Token/Cost Structure in `step_finish`
 
@@ -863,12 +925,17 @@ All events have the structure: `{"type":"<type>","timestamp":<ms>,"sessionID":"s
     "tokens": {
       "input": 1000,
       "output": 200,
-      "cache": { "read": 500 }
+      "reasoning": 50,
+      "cache": { "read": 500, "write": 25 }
     },
     "cost": 0.05
   }
 }
 ```
+
+The parser accumulates `input`, visible `output`, `cache.read`, and cost without
+changing existing footer mappings. Reasoning tokens and cache writes are not
+fully represented; the footer is not complete token accounting.
 
 ### Session Lifecycle
 
@@ -876,6 +943,21 @@ OpenCode has no explicit session-start or session-end event. The parser:
 1. Emits `SessionStart` on the first `step_start` event only (subsequent ones are ignored)
 2. Accumulates tokens and cost from all `step_finish` events
 3. Emits `SessionEnd` from `finish()` at EOF with accumulated stats
+
+Text and reasoning normally arrive as completed blocks. Reconciliation can emit
+missed content or a suffix; agentcat preserves supplied content and arrival order
+without replacement, history lookup, or additional deduplication.
+
+**Accepted limitations:** The completed-record adapter can briefly show a
+synthetic TTY spinner. Tool and completed-reasoning timings may measure local
+rendering rather than upstream execution/thinking; upstream durations are not
+used. `is_error` reflects only tool state: shell `exit`, `signal`, `timeout`, and
+`status` metadata is not interpreted, so a completed tool can display success
+despite command failure or still-running background execution. A completed
+subagent tool can likewise acknowledge background work that is not finished.
+Error-only streams without `step_start` require `--format opencode`; auto-detection
+is unchanged. Provider/session `error` records fail the session at EOF, unlike
+recoverable tool-state errors.
 
 ---
 
@@ -1036,13 +1118,16 @@ enum AgentKind {
 
 | OpenCode event | AgentEvent |
 |-------------|------------|
-| `step_start` (first only) | `SessionStart { session_id: part.sessionID, agent: OpenCode, model: None }` |
+| `step_start` (first only) | `SessionStart { session_id: part.sessionID or envelope sessionID, agent: OpenCode, model: None }` |
 | `step_start` (subsequent) | (ignored) |
 | `text` | `TextComplete(part.text)` |
 | `reasoning` | `ThinkingStart` + `ThinkingDelta(part.text)` + `ThinkingEnd` |
-| `tool_use` (state=`"running"`) | `ToolStart { name }` + `ToolReady { name, summary }` |
-| `tool_use` (state=`"completed"`) | `ToolResult { is_error: false, output }` |
-| `tool_use` (state=`"error"`) | `ToolResult { is_error: true, output }` |
+| `tool_use` (`state.status="completed"`) | `ToolStart { tool_name: part.tool, id: part.id }` + `ToolReady { tool_name: part.tool, input_summary: summary(state.input), id: part.id }` + `ToolResult { is_error: false, content: state.output, id: part.id }` |
+| `tool_use` (`state.status="error"`) | Same start/ready events + `ToolResult { is_error: true, content: state.error, id: part.id }`; no session failure |
+| `tool_use` (other object-state status) | (ignored; debug diagnostic if enabled) |
+| `tool_use` (string state=`"running"`) | Existing `ToolStart` + `ToolReady` using `part.name`/`part.input`, IDs `None` |
+| `tool_use` (string state=`"completed"` / `"error"`) | Existing `ToolResult { is_error: state == "error", content: part.output, id: None }` |
+| `retry`, `background_wait` | (ignored; no session failure) |
 | `step_finish` | (accumulate tokens and cost internally) |
 | `error` | (set error flag + message internally) |
 | (EOF) | `SessionEnd { success, cost_usd, input_tokens, output_tokens, cached_tokens }` (accumulated) |
